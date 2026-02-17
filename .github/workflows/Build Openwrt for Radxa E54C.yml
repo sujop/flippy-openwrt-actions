@@ -1,0 +1,278 @@
+name: Build OpenWrt for Radxa E54C
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_board:
+        description: 'Select device'
+        required: false
+        default: 'e54c'
+        type: choice
+        options:
+          - e54c
+          - e52c
+          - rock5b
+          - rock5c
+          - all
+      openwrt_kernel:
+        description: 'Kernel version'
+        required: false
+        default: '6.1.y_6.6.y'
+      auto_kernel:
+        description: 'Auto use latest kernel'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - true
+          - false
+
+env:
+  TZ: Pacific/Auckland
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    name: Build OpenWrt for E54C
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialization Environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi $(docker images -q) 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install $(curl -fsSL https://is.gd/depend_ubuntu2204_openwrt)
+          sudo -E systemctl daemon-reload
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo timedatectl set-timezone "$TZ"
+          echo "Environment initialized successfully"
+
+      - name: Download OpenWrt Rootfs
+        id: download
+        run: |
+          echo "========================================"
+          echo "Downloading OpenWrt ARM64 Rootfs"
+          echo "========================================"
+          mkdir -p openwrt
+          
+          # Define multiple download sources with names
+          declare -A SOURCES
+          SOURCES["ophub-flippy"]="https://github.com/ophub/flippy-openwrt-actions/releases/download/OpenWrt_armv8_save_2026.02/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          SOURCES["immortalwrt-23.05.3"]="https://downloads.immortalwrt.org/releases/23.05.3/targets/armsr/armv8/immortalwrt-armsr-armv8-generic-rootfs.tar.gz"
+          SOURCES["openwrt-23.05.5"]="https://downloads.openwrt.org/releases/23.05.5/targets/armsr/armv8/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          SOURCES["breakingbadboy"]="https://github.com/breakingbadboy/OpenWrt/releases/download/rootfs_2024/openwrt-armsr-armv8-generic-rootfs.tar.gz"
+          
+          SUCCESS=false
+          USED_SOURCE=""
+          USED_URL=""
+          ATTEMPT=0
+          TOTAL=${#SOURCES[@]}
+          
+          for source_name in "${!SOURCES[@]}"; do
+            url="${SOURCES[$source_name]}"
+            ATTEMPT=$((ATTEMPT + 1))
+            
+            echo ""
+            echo "----------------------------------------"
+            echo "Attempt $ATTEMPT of $TOTAL"
+            echo "Source: $source_name"
+            echo "URL: $url"
+            echo "----------------------------------------"
+            
+            if wget --timeout=300 --tries=3 --continue -O openwrt/rootfs.tar.gz "$url" 2>&1; then
+              if [ -f openwrt/rootfs.tar.gz ] && [ -s openwrt/rootfs.tar.gz ]; then
+                FILESIZE=$(stat -c%s openwrt/rootfs.tar.gz 2>/dev/null || stat -f%z openwrt/rootfs.tar.gz 2>/dev/null || echo "unknown")
+                echo "SUCCESS - Downloaded from: $source_name"
+                if [ "$FILESIZE" != "unknown" ]; then
+                  FILESIZE_MB=$((FILESIZE / 1024 / 1024))
+                  echo "File size: ${FILESIZE_MB} MB"
+                fi
+                USED_SOURCE="$source_name"
+                USED_URL="$url"
+                SUCCESS=true
+                break
+              else
+                echo "FAILED - File empty or invalid"
+                rm -f openwrt/rootfs.tar.gz
+              fi
+            else
+              echo "FAILED - Download error"
+              rm -f openwrt/rootfs.tar.gz
+            fi
+          done
+          
+          echo ""
+          echo "========================================"
+          if [ "$SUCCESS" = true ]; then
+            echo "ROOTFS DOWNLOAD COMPLETED"
+            echo "========================================"
+            echo "Source Used: $USED_SOURCE"
+            echo "URL: $USED_URL"
+            echo ""
+            echo "File details:"
+            ls -lh openwrt/
+            file openwrt/rootfs.tar.gz 2>/dev/null || true
+            
+            # Save to GitHub outputs
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "source=$USED_SOURCE" >> $GITHUB_OUTPUT
+            echo "url=$USED_URL" >> $GITHUB_OUTPUT
+            
+            # Save to environment variables
+            echo "ROOTFS_SOURCE=$USED_SOURCE" >> $GITHUB_ENV
+            echo "ROOTFS_URL=$USED_URL" >> $GITHUB_ENV
+          else
+            echo "ALL DOWNLOAD SOURCES FAILED"
+            echo "========================================"
+            echo "Tried $TOTAL different sources"
+            echo "status=failure" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Package OpenWrt Firmware
+        uses: ophub/flippy-openwrt-actions@main
+        if: steps.download.outputs.status == 'success'
+        env:
+          OPENWRT_ARMSR: openwrt/*.tar.gz
+          PACKAGE_SOC: ${{ github.event.inputs.openwrt_board || 'e54c' }}
+          KERNEL_REPO_URL: breakingbadboy/OpenWrt
+          KERNEL_VERSION_NAME: ${{ github.event.inputs.openwrt_kernel || '6.1.y_6.6.y' }}
+          KERNEL_AUTO_LATEST: ${{ github.event.inputs.auto_kernel || 'true' }}
+          OPENWRT_IP: 192.168.1.1
+          GZIP_IMGS: .gz
+          WHOAMI: flippy
+          SW_FLOWOFFLOAD: 1
+          HW_FLOWOFFLOAD: 0
+          SFE_FLOW: 1
+          ENABLE_WIFI_K504: 1
+          ENABLE_WIFI_K510: 1
+
+      - name: Upload to Release
+        uses: ncipollo/release-action@main
+        if: env.PACKAGED_STATUS == 'success'
+        with:
+          tag: OpenWrt_E54C_${{ env.PACKAGED_OUTPUTDATE }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## OpenWrt Firmware for Radxa E54C
+            
+            ### Build Information
+            - **Build Date:** ${{ env.PACKAGED_OUTPUTDATE }}
+            - **Device:** Radxa E54C (RK3588S)
+            - **Default IP:** 192.168.1.1
+            - **Default Login:** root / password
+            - **Kernel Version:** ${{ github.event.inputs.openwrt_kernel || '6.1.y_6.6.y' }}
+            - **Rootfs Source:** ${{ env.ROOTFS_SOURCE }}
+            
+            ### Installation Instructions
+            
+            #### Linux/macOS:
+            ```bash
+            # Extract the image
+            gunzip openwrt_rk3588s_e54c_*.img.gz
+            
+            # Find your SD card (BE CAREFUL!)
+            lsblk
+            
+            # Write to SD card (replace /dev/sdX with your device)
+            sudo dd if=openwrt_rk3588s_e54c_*.img of=/dev/sdX bs=4M status=progress
+            sync
+            ```
+            
+            #### Windows:
+            1. Extract the .img.gz file using 7-Zip
+            2. Use balenaEtcher or Rufus to write to SD card
+            3. Insert SD card into E54C and power on
+            
+            #### First Boot:
+            1. Connect E54C to your network via Ethernet
+            2. Access web interface at http://192.168.1.1
+            3. Login: username `root`, password `password`
+            4. Change the default password immediately!
+            
+            ### Features
+            - Software Flow Offload enabled
+            - SFE Flow enabled
+            - WiFi support (K504/K510)
+            - Latest stable kernel
+            
+            ### Build Details
+            - **Rootfs Source:** ${{ env.ROOTFS_SOURCE }}
+            - **Kernel Repository:** breakingbadboy/OpenWrt
+            - **Packaging Tool:** ophub/flippy-openwrt-actions
+            
+            ### Important Notes
+            - First boot may take 2-3 minutes
+            - Default network: WAN on port 1, LAN on ports 2-4
+            - Always backup your data before flashing
+            
+            ### Support
+            - [E54C Documentation](https://docs.radxa.com/en/e/e54c/)
+            - [OpenWrt Wiki](https://openwrt.org/)
+            - [Report Issues](https://github.com/${{ github.repository }}/issues)
+
+      - name: Delete Older Releases
+        uses: dev-drprasad/delete-older-releases@master
+        if: env.PACKAGED_STATUS == 'success'
+        with:
+          keep_latest: 5
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete Old Workflows
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 7
+          keep_minimum_runs: 3
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Device:** ${{ github.event.inputs.openwrt_board || 'e54c' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kernel:** ${{ github.event.inputs.openwrt_kernel || '6.1.y_6.6.y' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Auto Kernel:** ${{ github.event.inputs.auto_kernel || 'true' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.download.outputs.status }}" == "success" ]; then
+            echo "## Download Status" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status:** Success" >> $GITHUB_STEP_SUMMARY
+            echo "- **Rootfs Source:** ${{ steps.download.outputs.source }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Source URL:** ${{ steps.download.outputs.url }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "${{ env.PACKAGED_STATUS }}" == "success" ]; then
+              echo "## Build Status" >> $GITHUB_STEP_SUMMARY
+              echo "**SUCCESS** - Firmware built successfully!" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### Download Your Firmware" >> $GITHUB_STEP_SUMMARY
+              echo "[Go to Releases](https://github.com/${{ github.repository }}/releases/tag/OpenWrt_E54C_${{ env.PACKAGED_OUTPUTDATE }})" >> $GITHUB_STEP_SUMMARY
+            elif [ "${{ env.PACKAGED_STATUS }}" == "failure" ]; then
+              echo "## Build Status" >> $GITHUB_STEP_SUMMARY
+              echo "**FAILED** - Packaging failed. Check the Package OpenWrt Firmware step for details." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "## Download Status" >> $GITHUB_STEP_SUMMARY
+            echo "**FAILED** - Could not download rootfs from any source" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Attempted Sources" >> $GITHUB_STEP_SUMMARY
+            echo "- ophub-flippy" >> $GITHUB_STEP_SUMMARY
+            echo "- immortalwrt-23.05.3" >> $GITHUB_STEP_SUMMARY
+            echo "- openwrt-23.05.5" >> $GITHUB_STEP_SUMMARY
+            echo "- breakingbadboy" >> $GITHUB_STEP_SUMMARY
+          fi
